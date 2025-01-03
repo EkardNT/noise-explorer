@@ -1,11 +1,17 @@
-use std::{collections::HashSet, sync::{atomic::{AtomicUsize, Ordering}, mpsc::{Receiver, RecvError, Sender}, Arc}};
+use std::{any::Any, collections::{HashMap, HashSet}, hint::black_box, sync::{atomic::{AtomicUsize, Ordering}, mpsc::{Receiver, RecvError, Sender}, Arc}};
 
-use egui::{include_image, Align, ImageSource, Layout, Pos2, Ui, Vec2};
+use datazoo::Bimultimap;
+use egui::{include_image, Align, Color32, ImageSource, Layout, Pos2, RichText, Ui, Vec2};
 use egui_snarl::{ui::{BackgroundPattern, Grid, PinInfo, SnarlStyle, SnarlViewer, WireStyle}, NodeId, Snarl};
-use noise::NoiseFn;
+use noise::{utils::{NoiseFnWrapper, PlaneMapBuilder}, NoiseFn};
 use serde::{Deserialize, Serialize};
+use slotmap::SlotMap;
 
-use crate::noises::{self, NoiseClassification, NoiseConfig, NoiseType};
+use crate::noises::{self, DynNoise, NoiseClassification, NoiseConfig, NoiseType};
+
+slotmap::new_key_type! {
+    pub struct NodeSlotKey;
+}
 
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 #[derive(serde::Deserialize, serde::Serialize, Default)]
@@ -15,6 +21,7 @@ struct PersistableApp {
     node_type_filter_lowercase: String,
     node_graph: Snarl<GraphNode>,
     node_graph_style: SnarlStyle,
+    slot_to_node: SlotMap<NodeSlotKey, NodeId>,
 }
 
 pub struct NoiseExplorerApp {
@@ -22,9 +29,10 @@ pub struct NoiseExplorerApp {
     node_type_filter_lowercase: String,
     node_graph: Snarl<GraphNode>,
     node_graph_style: SnarlStyle,
-    changed_nodes: HashSet<NodeId>,
+    changed_nodes: HashSet<NodeSlotKey>,
     recalculate_sender: std::sync::mpsc::Sender<RecalculateRequest>,
     recalculate_receiver: std::sync::mpsc::Receiver<RecalculateResult>,
+    slot_to_node: SlotMap<NodeSlotKey, NodeId>,
 }
 
 impl NoiseExplorerApp {
@@ -56,7 +64,8 @@ impl NoiseExplorerApp {
             },
             changed_nodes: HashSet::new(),
             recalculate_sender: request_tx,
-            recalculate_receiver: response_rx
+            recalculate_receiver: response_rx,
+            slot_to_node: SlotMap::with_key(),
         }
     }
 }
@@ -69,13 +78,36 @@ fn recalculator_thread(request_rx: Receiver<RecalculateRequest>, response_tx: Se
             // This request has been superseded, skip it.
             continue;
         }
+        
+        let mut image_colors = Vec::with_capacity(request.texture_width * request.texture_height);
+        let mut noise_min = std::f64::MAX;
+        let mut noise_max = std::f64::MIN;
+        for y in 0..request.texture_height {
+            for x in 0..request.texture_width {
+                let noise_val = request.noise_fn.get([
+                    x as f64 / request.texture_width as f64 * request.noise_width,
+                    y as f64 / request.texture_height as f64 * request.noise_height
+                ]);
+                if noise_val < noise_min {
+                    noise_min = noise_val;
+                }
+                if noise_val > noise_max {
+                    noise_max = noise_val;
+                }
+                // This assumes the noise is in the range [-1, 1].
+                let noise_u8 = ((noise_val * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
+                image_colors.push(egui::Color32::from_gray(noise_u8));
+            }
+        }
 
-        // TODO: delete me, just for demonstration
-        std::thread::sleep_ms(1000);
+        // TODO: somehow actually convert this into a texture egui can display.
+        std::hint::black_box(image_colors);
 
         if response_tx.send(RecalculateResult {
             node_id: request.node_id,
             new_version: request.new_version,
+            noise_max,
+            noise_min,
             texture: ()
         }).is_ok() {
             ctx.request_repaint();
@@ -98,16 +130,17 @@ impl NoiseExplorerApp {
 
         // Load previous app state (if any).
         // Note that you must enable the `persistence` feature for this to work.
-        if let Some(storage) = cc.storage {
-            let persistable: PersistableApp = eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
-            return Self {
-                node_type_filter: persistable.node_type_filter,
-                node_type_filter_lowercase: persistable.node_type_filter_lowercase,
-                node_graph: persistable.node_graph,
-                node_graph_style: persistable.node_graph_style,
-                ..default
-            };
-        }
+        // if let Some(storage) = cc.storage {
+        //     let persistable: PersistableApp = eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
+        //     return Self {
+        //         node_type_filter: persistable.node_type_filter,
+        //         node_type_filter_lowercase: persistable.node_type_filter_lowercase,
+        //         node_graph: persistable.node_graph,
+        //         node_graph_style: persistable.node_graph_style,
+        //         slot_to_node: persistable.slot_to_node,
+        //         ..default
+        //     };
+        // }
 
         default
     }
@@ -116,21 +149,24 @@ impl NoiseExplorerApp {
 impl eframe::App for NoiseExplorerApp {
     /// Called by the frame work to save state before shutdown.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, eframe::APP_KEY, &PersistableApp {
-            node_type_filter: std::mem::take(&mut self.node_type_filter),
-            node_type_filter_lowercase: std::mem::take(&mut self.node_type_filter_lowercase),
-            node_graph: std::mem::take(&mut self.node_graph),
-            node_graph_style: std::mem::take(&mut self.node_graph_style),
-        });
+        // eframe::set_value(storage, eframe::APP_KEY, &PersistableApp {
+        //     node_type_filter: std::mem::take(&mut self.node_type_filter),
+        //     node_type_filter_lowercase: std::mem::take(&mut self.node_type_filter_lowercase),
+        //     node_graph: std::mem::take(&mut self.node_graph),
+        //     node_graph_style: std::mem::take(&mut self.node_graph_style),
+        //     slot_to_node: std::mem::take(&mut self.slot_to_node),
+        // });
     }
 
     /// Called each time the UI needs repainting, which may be many times per second.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(response) = self.recalculate_receiver.try_recv() {
             // If None, node was deleted in the mean time.
-            let Some(node) = self.node_graph.get_node_mut(response.node_id) else { continue };
+            let Some(&node_id) = self.slot_to_node.get(response.node_id) else { continue };
+            let node = self.node_graph.get_node_mut(node_id).expect("Didn't find node");
             if node.config_version.load(Ordering::SeqCst) == response.new_version {
                 node.data_version = response.new_version;
+                node.noise_range = Some((response.noise_min, response.noise_max));
                 // TODO: set texture from response
             }
         }
@@ -143,7 +179,7 @@ impl eframe::App for NoiseExplorerApp {
                 egui::widgets::global_theme_preference_buttons(ui);
                 ui.separator();
                 ui.add(egui::github_link_file!(
-                    "https://github.com/emilk/eframe_template/blob/main/",
+                    "https://github.com/EkardNT/noise-explorer/blob/main/",
                     "Source code."
                 ));
                 powered_by_egui_and_eframe(ui);
@@ -157,22 +193,60 @@ impl eframe::App for NoiseExplorerApp {
                 node_type_filter: &mut self.node_type_filter,
                 node_type_filter_lowercase: &mut self.node_type_filter_lowercase,
                 clear_graph: false,
-                changed_nodes: &mut self.changed_nodes
+                changed_nodes: &mut self.changed_nodes,
+                slot_to_node: &mut self.slot_to_node,
             };
             node_graph.show(&mut viewer, &self.node_graph_style, "noise_graph", ui);
             if !viewer.clear_graph {
                 self.node_graph = node_graph;
             }
-            for changed_node in self.changed_nodes.drain() {
-                let Some(node) = self.node_graph.get_node_mut(changed_node) else { continue };
-                let new_version = node.config_version.fetch_add(1, Ordering::SeqCst) + 1;
-                let _ = self.recalculate_sender.send(RecalculateRequest {
-                    node_id: changed_node,
-                    new_version: new_version,
-                    config_version: Arc::clone(&node.config_version),
-                    noise_fn: ()
-                });
+
+
+            if !self.changed_nodes.is_empty() {
+                // Build the set of dirty nodes by iterating over the changed nodes and adding both them and their linked dependencies.
+                let connections: Bimultimap<NodeSlotKey, NodeSlotKey> = self.node_graph
+                    .wires()
+                    .flat_map(|(out_pin, in_pin)| {
+                        let Some(out_node) = self.node_graph.get_node(out_pin.node) else { return None.into_iter() };
+                        let Some(in_node) = self.node_graph.get_node(in_pin.node) else { return None.into_iter() };
+                        Some((in_node.node_id_key, out_node.node_id_key)).into_iter()
+                    })
+                    .collect();
+                fn add_dirty_tree(
+                        node: NodeSlotKey,
+                        connections: &Bimultimap<NodeSlotKey, NodeSlotKey>,
+                        to: &mut HashSet<NodeSlotKey>) {
+                    if !to.insert(node) {
+                        return;
+                    }
+                    for &dependent_node in connections.get(&node) {
+                        add_dirty_tree(dependent_node, connections, to);
+                    }
+                }
+    
+                let mut dirty_nodes: HashSet<NodeSlotKey> = HashSet::new();
+                for changed_node in self.changed_nodes.drain() {
+                    add_dirty_tree(changed_node, &connections, &mut dirty_nodes);
+                }
+                for dirty_node in dirty_nodes.drain() {
+                    let &node_id = self.slot_to_node.get(dirty_node).expect("Didn't find node");
+                    let node = self.node_graph.get_node_mut(node_id).expect("Didn't find node in graph");
+                    let new_version = node.config_version.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = self.recalculate_sender.send(RecalculateRequest {
+                        node_id: dirty_node,
+                        new_version: new_version,
+                        config_version: Arc::clone(&node.config_version),
+                        noise_fn: DynNoise::new(noise::Constant::new(0.5)),
+                        texture_height: 256,
+                        texture_width: 256,
+                        noise_width: 1.0,
+                        noise_height: 1.0
+                    });
+                }
             }
+            
+
+            
         });
     }
 }
@@ -193,9 +267,11 @@ fn powered_by_egui_and_eframe(ui: &mut egui::Ui) {
 
 #[derive(Serialize, Deserialize)]
 pub struct GraphNode {
+    node_id_key: NodeSlotKey,
     noise_type: NoiseType,
     config: NoiseConfig,
     data_version: usize,
+    noise_range: Option<(f64, f64)>,
     config_version: Arc<AtomicUsize>,
 }
 
@@ -203,7 +279,8 @@ struct GraphNodeViewer<'app> {
     node_type_filter: &'app mut String,
     node_type_filter_lowercase: &'app mut String,
     clear_graph: bool,
-    changed_nodes: &'app mut HashSet<NodeId>,
+    changed_nodes: &'app mut HashSet<NodeSlotKey>,
+    slot_to_node: &'app mut SlotMap<NodeSlotKey, NodeId>,
 }
 
 impl<'app> GraphNodeViewer<'app> {
@@ -211,12 +288,18 @@ impl<'app> GraphNodeViewer<'app> {
         let response = ui.button(noise_type.name());
     
         if response.clicked() {
-            self.changed_nodes.insert(node_graph.insert_node(pos, GraphNode {
-                noise_type: *noise_type,
-                config: noise_type.config(),
-                data_version: 0,
-                config_version: Arc::new(AtomicUsize::new(0)),
-            }));
+            self.slot_to_node.insert_with_key(|key| {
+                let node_id = node_graph.insert_node(pos, GraphNode {
+                    node_id_key: key,
+                    noise_type: *noise_type,
+                    config: noise_type.config(),
+                    data_version: 0,
+                    noise_range: None,
+                    config_version: Arc::new(AtomicUsize::new(0)),
+                });
+                self.changed_nodes.insert(key);
+                node_id
+            });
             ui.close_menu();
         }
     }
@@ -266,12 +349,14 @@ impl<'app> SnarlViewer<GraphNode> for GraphNodeViewer<'app> {
             snarl: &mut Snarl<GraphNode>,
         ) {
         if let Some(graph_node) = snarl.get_node_mut(node) {
+            let node_key = graph_node.node_id_key;
             match graph_node.noise_type.show_header(&mut graph_node.config, ui, scale) {
                 noises::HeaderResponse::Remove => {
                     snarl.remove_node(node);
+                    self.slot_to_node.remove(node_key);
                 }
                 noises::HeaderResponse::Changed => {
-                    self.changed_nodes.insert(node);
+                    self.changed_nodes.insert(graph_node.node_id_key);
                 },
                 noises::HeaderResponse::None => {
                     /* Nothing to do */
@@ -296,7 +381,7 @@ impl<'app> SnarlViewer<GraphNode> for GraphNodeViewer<'app> {
         let node = snarl.get_node_mut(node_id).unwrap();
         let changed = node.noise_type.show_body(&mut node.config, ui, scale);
         if changed {
-            self.changed_nodes.insert(node_id);
+            self.changed_nodes.insert(node.node_id_key);
         }
         static IMAGE: ImageSource<'static> = egui::include_image!("../assets/fbm.png");
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
@@ -310,6 +395,16 @@ impl<'app> SnarlViewer<GraphNode> for GraphNodeViewer<'app> {
             ui.horizontal(|ui| {
                 ui.label(&format!("Config version: {}", node.config_version.load(Ordering::SeqCst)));
             });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                if let Some(range) = node.noise_range {
+                    ui.label("Noise range: [");
+                    ui.label(RichText::new(format!("{}", range.0)).color(if range.0 < -1.0 { Color32::RED } else { ui.style().visuals.text_color() }));
+                    ui.label(", ");
+                    ui.label(RichText::new(format!("{}", range.1)).color(if range.1 > 1.0 { Color32::RED } else { ui.style().visuals.text_color() }));
+                    ui.label("]");
+                }
+            })
         });
     }
 
@@ -365,21 +460,36 @@ impl<'app> SnarlViewer<GraphNode> for GraphNodeViewer<'app> {
     fn connect(&mut self, from: &egui_snarl::OutPin, to: &egui_snarl::InPin, snarl: &mut Snarl<GraphNode>) {
         if from.id.node != to.id.node {
             snarl.connect(from.id, to.id);
-            self.changed_nodes.insert(to.id.node);
+            self.changed_nodes.insert(snarl.get_node(to.id.node).unwrap().node_id_key);
+        }
+    }
+
+    fn disconnect(&mut self, from: &egui_snarl::OutPin, to: &egui_snarl::InPin, snarl: &mut Snarl<GraphNode>) {
+        snarl.disconnect(from.id, to.id);
+        if let Some(from_node) = snarl.get_node(from.id.node) {
+            self.changed_nodes.insert(from_node.node_id_key);
+        }
+        if let Some(to_node) = snarl.get_node(to.id.node) {
+            self.changed_nodes.insert(to_node.node_id_key);
         }
     }
 }
 
 struct RecalculateRequest {
-    node_id: NodeId,
+    node_id: NodeSlotKey,
     new_version: usize,
     config_version: Arc<AtomicUsize>,
-    // noise_fn: Box<dyn NoiseFn<f64, 2>>,
-    noise_fn: () // TODO
+    texture_width: usize,
+    texture_height: usize,
+    noise_width: f64,
+    noise_height: f64,
+    noise_fn: DynNoise,
 }
 
 struct RecalculateResult {
-    node_id: NodeId,
+    node_id: NodeSlotKey,
     new_version: usize,
+    noise_max: f64,
+    noise_min: f64,
     texture: () // TODO
 }

@@ -16,18 +16,20 @@ eframe = { version = "0.30", default-features = false, features = [
     "accesskit",     # Make egui compatible with screen readers. NOTE: adds a lot of dependencies.
     "default_fonts", # Embed the default egui fonts.
     "glow",          # Use the glow rendering backend. Alternative: "wgpu".
-    "persistence",   # Enable restoring app state when restarting the app.
+    #"persistence",   # Enable restoring app state when restarting the app.
     "wayland",       # To support Linux (and CI)
 ] }
 log = "0.4"
 
 # You only need serde if you want app persistence:
 serde = { version = "1", features = ["derive"] }
-noise = { version = "0.9.0", features = ["std"] }
+noise = { version = "0.9.0", features = ["std", "images"] }
 strum = { version = "0.26.3", features = ["derive"] }
 egui-snarl = { version = "0.6.0", features = ["egui-probe", "serde"] }
 image = { version = "0.25.5", features = ["png"] }
 egui_extras = { version = "0.30.0", features = ["all_loaders"] }
+slotmap = { version = "1.0.7", features = ["serde"] }
+datazoo = { version = "0.7.0", default-features = false }
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

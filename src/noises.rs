@@ -1,7 +1,21 @@
 use egui::{Align, ImageSource, Layout, Vec2};
-use noise::Perlin;
+use noise::{NoiseFn, Perlin};
 use serde::{Deserialize, Serialize};
 use strum::{IntoStaticStr, VariantArray};
+
+pub struct DynNoise(Box<dyn NoiseFn<f64, 2> + Send + 'static>);
+
+impl DynNoise {
+    pub fn new(noise_fn: impl NoiseFn<f64, 2> + Send + 'static) -> Self {
+        Self(Box::new(noise_fn))
+    }
+}
+
+impl NoiseFn<f64, 2> for DynNoise {
+    fn get(&self, point: [f64; 2]) -> f64 {
+        self.0.get(point)
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum NoiseClassification {
